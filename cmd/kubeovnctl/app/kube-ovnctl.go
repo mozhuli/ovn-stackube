@@ -32,7 +32,7 @@ func Run() error {
 		Long:  `run kube-ovnctl to init master, minion, gateway`,
 	}
 
-	materCmd := cmd.InitMaster()
+	masterCmd := cmd.InitMaster()
 	minionCmd := cmd.InitMinion()
 	gatewayCmd := cmd.InitGateway()
 

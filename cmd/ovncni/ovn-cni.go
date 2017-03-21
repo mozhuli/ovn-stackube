@@ -18,7 +18,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/containernetworking/cni/pkg/ip"
@@ -26,22 +28,24 @@ import (
 	"github.com/containernetworking/cni/pkg/ns"
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
-	"github.com/containernetworking/cni/pkg/version"
+	//"github.com/containernetworking/cni/pkg/version"
+	"github.com/heartlock/ovn-kubernetes/pkg/common"
 	"github.com/heartlock/ovn-kubernetes/pkg/exec"
 	"github.com/vishvananda/netlink"
 )
 
-const defaultBrName = "cni0"
-
+// NetConf stores the common network config for ovn CNI plugin
 type NetConf struct {
-	types.NetConf
-	BrName       string `json:"bridge"`
-	IsGW         bool   `json:"isGateway"`
-	IsDefaultGW  bool   `json:"isDefaultGateway"`
-	ForceAddress bool   `json:"forceAddress"`
-	IPMasq       bool   `json:"ipMasq"`
-	MTU          int    `json:"mtu"`
-	HairpinMode  bool   `json:"hairpinMode"`
+	Bridge string `json:"bridge"`
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	IPAM   struct {
+		Type   string `json:"type"`
+		Subnet string `json:"subnet"`
+	} `json:"ipam,omitempty"`
+	IPMasq    bool   `json:"ipMasq"`
+	IsGateway bool   `json:"isGateway"`
+	LogLevel  string `json:"log_level"`
 }
 
 func init() {
@@ -51,16 +55,6 @@ func init() {
 	runtime.LockOSThread()
 }
 
-func loadNetConf(bytes []byte) (*NetConf, error) {
-	n := &NetConf{
-		BrName: defaultBrName,
-	}
-	if err := json.Unmarshal(bytes, n); err != nil {
-		return nil, fmt.Errorf("failed to load netconf: %v", err)
-	}
-	return n, nil
-}
-
 func setupInterface(containerId string, netns ns.NetNS, ifName string, macAddress string) (string, error) {
 	var hostVethName string
 
@@ -68,15 +62,15 @@ func setupInterface(containerId string, netns ns.NetNS, ifName string, macAddres
 		// create the veth pair in the container and move host end into host netns
 		hostVeth, contVeth, err := ip.SetupVeth(ifName, mtu, hostNS)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		hw, err := net.ParseMAC(macAddress)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		err = netlink.LinkSetHardwareAddr(contVeth, hw)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		hostVethName = hostVeth.Attrs().Name
@@ -84,21 +78,21 @@ func setupInterface(containerId string, netns ns.NetNS, ifName string, macAddres
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
 	// need to lookup hostVeth again as its index has changed during ns move
 	hostVeth, err := netlink.LinkByName(hostVethName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to lookup %q: %v", hostVethName, err)
+		return "", fmt.Errorf("failed to lookup %q: %v", hostVethName, err)
 	}
 
 	// set hairpin mode
 	if err = netlink.LinkSetHairpin(hostVeth, hairpinMode); err != nil {
-		return fmt.Errorf("failed to setup hairpin mode for %v: %v", hostVethName, err)
+		return "", fmt.Errorf("failed to setup hairpin mode for %v: %v", hostVethName, err)
 	}
 	if err = netlink.LinkSetName(hostVeth, containerId[:15]); err != nil {
-		return nil, err
+		return "", err
 	}
 
 	return containerId[:15], nil
@@ -106,25 +100,26 @@ func setupInterface(containerId string, netns ns.NetNS, ifName string, macAddres
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
-	n, err := loadNetConf(args.StdinData)
-	if err != nil {
-		return err
+	conf := NetConf{}
+	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
+		return fmt.Errorf("failed to load netconf: %v", err)
 	}
 
-	if n.IsDefaultGW {
-		n.IsGW = true
+	re, err := exec.RunCommand("--if-exists", "get", "Open_vSwitch", ".", "external_ids:k8s-api-server")
+	if err != nil || re == nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("failed get k8sApiServer")
+	}
+	k8sApiServer := strings.Trim(re[0], "\"")
+	if !strings.HasPrefix(k8sApiServer, "http") {
+		k8sApiServer = "http://" + k8sApiServer
 	}
 
-	k8sApiServer, err := exec.RunCommand("--if-exists", "get", "Open_vSwitch", ".", "external_ids:k8s-api-server")
-	if err != nil {
-		return fmt.Errorf("get k8s apiserver fail: %v", err)
-	}
-	k8sApiServer = "http://" + k8sApiServer
-
-	ArgsMap := make(map[string]string)
-	for cniArg := range args.Args.Split(";") {
-		k, v := cniArg.Split("=")
-		cniArgsMap[k] = v
+	cniArgsMap := make(map[string]string)
+	for _, cniArg := range strings.Split(args.Args, ";") {
+		cniArgsMap[strings.Split(cniArg, "=")[0]] = strings.Split(cniArg, "=")[1]
 	}
 	namespace, ok := cniArgsMap["K8S_POD_NAMESPACE"]
 	if !ok {
@@ -140,19 +135,18 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	counter := 30
-
+	var annotations map[string]interface{}
 	for ; counter > 0; counter-- {
-		annotations, err := kubernetes.GetPodAnnotations(k8sApiServer, namespace, podName)
+		annotations, err := common.GetPodAnnotations(k8sApiServer, namespace, podName)
 		if err != nil {
 			return fmt.Errorf("failed to get pod annotation: %v", err)
 		}
-		if annotation {
-			if ovn, ok := annotation["ovn"]; ok {
+		if annotations != nil {
+			if ovn, ok := annotations["ovn"]; ok {
 				break
 			}
 		}
-
-		time.Sleep(0.1)
+		time.Sleep(100 * time.Millisecond)
 	}
 	ovn := annotations["ovn"].(map[string]string)
 	macAddress, ok := ovn["mac_address"]
@@ -163,14 +157,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if !ok {
 		return fmt.Errorf("missing key ipAddress")
 	}
-
 	gatewayIp, ok := ovn["gateway_ip"]
 	if !ok {
 		return fmt.Errorf("missing key gatewayIp")
 	}
 	var result *types.Result
-	ipc, ipnet, err := net.ParseCIDR(ipAddress)
-	ipg, _, err := net.ParseCIDR(gatewayIp)
+	ipc, ipnet, _ := net.ParseCIDR(ipAddress)
+	//ipg, _, err := net.ParseCIDR(gatewayIp)
 	ipnet.IP = ipc
 	result.IP4.IP = ipnet
 	result.IP4.Gateway = ipg
@@ -185,7 +178,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if err != nil {
 		return err
 	}
-
 	if err := netns.Do(func(_ ns.NetNS) error {
 		// set the default gateway if requested
 		if n.IsDefaultGW {
@@ -228,23 +220,50 @@ func cmdAdd(args *skel.CmdArgs) error {
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	n, err := loadNetConf(args.StdinData)
+	conf := NetConf{}
+	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
+		return fmt.Errorf("failed to load netconf: %v", err)
+	}
+
+	if args.Netns != "" {
+		fmt.Fprintf(os.Stderr, "Calico CNI deleting device in netns %s\n", args.Netns)
+		err := ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
+			_, err := ip.DelLinkByNameAddr(args.IfName, netlink.FAMILY_V4)
+			return err
+		})
+
+		if err != nil {
+			return err
+		}
+	}
+	_, err := exec.RunCommand("ovs-vsctl", "del-port", args.ContainerID[:15])
 	if err != nil {
 		return err
 	}
-
-	if args.Netns == "" {
-		return nil
-	}
-
-	_, err = exec.RunCommand("ovs-vsctl", "del-port", args.ContainerID[:15])
+	_, err = exec.RunCommand("rm", "-f", "/var/run/netns/"+args.ContainerID[:15])
 	if err != nil {
 		return err
 	}
-
 	return nil
 }
 
+// VERSION is filled out during the build process (using git describe output)
+var VERSION string
+
 func main() {
-	skel.PluginMain(cmdAdd, cmdDel, version.Legacy)
+	// Display the version on "-v", otherwise just delegate to the skel code.
+	// Use a new flag set so as not to conflict with existing libraries which use "flag"
+	flagSet := flag.NewFlagSet("ovn-cni", flag.ExitOnError)
+
+	version := flagSet.Bool("v", false, "Display version")
+	err := flagSet.Parse(os.Args[1:])
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	if *version {
+		fmt.Println(VERSION)
+		os.Exit(0)
+	}
+	skel.PluginMain(cmdAdd, cmdDel)
 }

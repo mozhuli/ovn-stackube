@@ -2,9 +2,10 @@ package cmd
 
 import (
 	"fmt"
-	"net"
+	"strings"
 
-	"github.com/hyperhq/kubestack/pkg/exec"
+	"github.com/heartlock/ovn-kubernetes/pkg/common"
+	"github.com/heartlock/ovn-kubernetes/pkg/exec"
 	"github.com/spf13/cobra"
 )
 
@@ -15,8 +16,9 @@ func InitMaster() *cobra.Command {
 		Short: "init ovn master",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := initMaster(cmd, args); err != nil {
-				return fmt.Errorf("failed init master: %v", err)
+				return fmt.Errorf("failed init minion: %v", err)
 			}
+			return nil
 		},
 	}
 
@@ -28,7 +30,6 @@ func InitMaster() *cobra.Command {
 }
 
 func initMaster(cmd *cobra.Command, args []string) error {
-
 	_, err := fetchOVNNB()
 	if err != nil {
 		return err
@@ -36,47 +37,51 @@ func initMaster(cmd *cobra.Command, args []string) error {
 
 	masterSwitchSubnet := cmd.Flags().Lookup("master-switch-subnet").Value.String()
 	if masterSwitchSubnet == "" {
-		return fmt.Errorf("failed get master-switch-subnet")
+		return fmt.Errorf("argument --master-switch-subnet should be non-null")
 	}
 
 	clusterIpSubnet := cmd.Flags().Lookup("cluster-ip-subnet").Value.String()
 	if clusterIpSubnet == "" {
-		return fmt.Errorf("failed get cluster-ip-subnet")
+		return fmt.Errorf("argument --cluster-ip-subnet should be non-null")
 	}
 
 	nodeName := cmd.Flags().Lookup("node-name").Value.String()
-	if nodNname == "" {
-		return fmt.Errorf("failed get node-name")
+	if nodeName == "" {
+		return fmt.Errorf("argument --cluster-ip-subnet should be non-null")
 	}
 
 	// Create a single common distributed router for the cluster.
-	_, err = exec.RunCommand("ovn-nbctl", "--", "--may-exist", "lr-add", nodNname, "--", "set", "logical_router", nodeName, "external_ids:k8s-cluster-router=yes")
+	_, err = exec.RunCommand("ovn-nbctl", "--", "--may-exist", "lr-add", nodeName, "--", "set", "logical_router", nodeName, "external_ids:k8s-cluster-router=yes")
 	if err != nil {
-		return fmt.Errorf("failed create single common distributed: %v", err)
+		return fmt.Errorf("failed create single common distributed router: %v", err)
 	}
 
 	// Create 2 load-balancers for east-west traffic.  One handles UDP and another handles TCP.
-	k8sClusterLbTcp, err := exec.RunCommand("ovn-nbctl", "--data=bare", "--no-heading", "--columns=_uuid", "find", "load_balancer", "external_ids:k8s-cluster-lb-tcp=yes")
-	if err != nil {
-		return fmt.Errorf("failed find tcp load-balancer: %v", err)
+	re, err := exec.RunCommand("ovn-nbctl", "--data=bare", "--no-heading", "--columns=_uuid", "find", "load_balancer", "external_ids:k8s-cluster-lb-tcp=yes")
+	if err != nil || re == nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("failed find k8sClusterLbTcp")
 	}
-
-	//判断条件有待分析
-	if k8sClusterLbTcp == nil {
+	k8sClusterLbTcp := re[0]
+	if k8sClusterLbTcp == "" {
 		_, err = exec.RunCommand("ovn-nbctl", "--", "create", "load_balancer", "external_ids:k8s-cluster-lb-tcp=yes")
 		if err != nil {
 			return fmt.Errorf("failed create tcp load-balancer: %v", err)
 		}
 	}
 
-	k8sClusterLbUdp, err := exec.RunCommand("ovn-nbctl", "--data=bare", "--no-heading", "--columns=_uuid", "find", "load_balancer", "external_ids:k8s-cluster-lb-udp=yes")
-	if err != nil {
-		return fmt.Errorf("failed find udp load-balancer: %v", err)
+	re, err = exec.RunCommand("ovn-nbctl", "--data=bare", "--no-heading", "--columns=_uuid", "find", "load_balancer", "external_ids:k8s-cluster-lb-udp=yes")
+	if err != nil || re == nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("failed find k8sClusterLbUdp")
 	}
-
-	//判断条件有待分析
-	if k8sClusterLbUdp == nil {
-		_, err = exec.RunCommand("ovn-nbctl", "--", "create", "load_balancer", "external_ids:k8s-cluster-lb-udp=yes")
+	k8sClusterLbUdp := re[0]
+	if k8sClusterLbUdp == "" {
+		_, err = exec.RunCommand("ovn-nbctl", "--", "create", "load_balancer", "external_ids:k8s-cluster-lb-udp=yes", "protocol=udp")
 		if err != nil {
 			return fmt.Errorf("failed create udp load-balancer: %v", err)
 		}
@@ -88,12 +93,15 @@ func initMaster(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed create logical switch called join: %v", err)
 	}
-
 	// Connect the distributed router to "join"
-	routerMac, err := exec.RunCommand("ovn-nbctl", "--if-exist", "get", "logical_router_port", "rtoj-"+nodeName, "mac")
-	if err != nil {
-		return fmt.Errorf("failed get rtoj-%v mac: %v", nodeName, err)
+	re, err = exec.RunCommand("ovn-nbctl", "--if-exist", "get", "logical_router_port", "rtoj-"+nodeName, "mac")
+	if err != nil || re == nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("failed get rtoj-%v mac", nodeName)
 	}
+	routerMac := strings.Trim(re[0], "\"")
 	if routerMac == "" {
 		routerMac = common.GenerateMac()
 		_, err = exec.RunCommand("ovn-nbctl", "--", "--may-exist", "lrp-add", nodeName, "rtoj-"+nodeName, routerMac, "100.64.1.1/24", "--", "set", "logical_router_port", "rtoj-"+nodeName, "external_ids:connect_to_join=yes")
@@ -109,124 +117,5 @@ func initMaster(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed create management port: %v", err)
 	}
-
-}
-
-// Create a logical switch for the node and connect it to the distributed router.  This switch will start with one logical port (A OVS internal interface).
-// Thislogical port is via which other nodes and containers access the k8s master servers and is also used for health checks.
-func createManagementPort(nodename, localsubnet, clustersubnet string) error {
-	// Create a router port and provide it the first address in the 'local_subnet'.
-	ipByte, networkByte := net.ParseCIDR(localsubnet)
-	networkByte.IP = common.NextIP(networkByte.IP)
-	routerIPMask := networkByte.String()
-	routerIP := networkByte.IP.String()
-
-	routerMac, err := exec.RunCommand("ovn-nbctl", "--if-exist", "get", "logical_router_port", "rtos-"+nodename, "mac")
-	if err != nil {
-		return err
-	}
-	if routerMac == "" {
-		routerMac = common.GenerateMac()
-		clusterRouter := getClusterRouter()
-		_, err = exec.RunCommand("ovn-nbctl", "--may-exist", "lrp-add", clusterRouter, "rtos-"+nodename, routerMac, routerIPMask)
-		if err != nil {
-			return err
-		}
-	}
-	// Create a logical switch and set its subnet.
-	_, err = exec.RunCommand("ovn-nbctl", "--", "--may-exist", "ls-add", nodename, "--", "set", "logical_switch", nodename, "other-config:subnet="+localsubnet, "external-ids:gateway_ip="+routerIPMask)
-	if err != nil {
-		return err
-	}
-
-	// Connect the switch to the router.
-	_, err = exec.RunCommand("ovn-nbctl", "--", "--may-exist", "lsp-add", nodename, "stor-"+nodename, "--", "set", "logical_switch_port", "stor-"+nodename, "type=router", "options:router-port=rtos-"+nodename, "addresses="+"\""+routerMac+"\"")
-	if err != nil {
-		return err
-	}
-
-	interfaceName = "k8s-" + (nodename[:11])
-
-	// Create a OVS internal interface
-	_, err = exec.RunCommand("ovs-vsctl", "--", "--may-exist", "add-port", "br-int", interfaceName, "--", "set", "interface", interfaceName, "type=internal", "mtu_request=1400", "external-ids:iface-id=k8s-"+nodename)
-	if err != nil {
-		return err
-	}
-	macAddress, err := exec.RunCommand("ovs-vsctl", "--if-exists", "get", "interface", interfaceName, "mac_in_use")
-	if err != nil || macAddress == "" {
-		if err != nil {
-			return err
-		}
-		return fmt.Errorf("failed to get mac address of ovn-k8s-master")
-	}
-
-	// Create the OVN logical port.
-	networkByte.IP = common.NextIP(networkByte.IP)
-	portIP := networkByte.IP.String()
-portIPMask:
-	networkByte.String()
-	_, err = exec.RunCommand("ovn-nbctl", "--", "--may-exist", "lsp-add", nodename, "k8s-"+nodename, "--", "lsp-set-addresses", "k8s-"+nodename, macAddress+" "+portIP)
-	if err != nil {
-		return err
-	}
-
-	// Up the interface.
-	_, err = exec.RunCommand("ip", "link", "set", interfaceName, "up")
-	if err != nil {
-		return err
-	}
-
-	// The interface may already exist, in which case delete the routes and IP.
-	_, err = exec.RunCommand("ip", "addr", "flush", "dev", interfaceName)
-	if err != nil {
-		return err
-	}
-
-	// Assign IP address to the internal interface.
-	_, err = exec.RunCommand("ip", "addr", "add", portIPMask, "dev", interfaceName)
-	if err != nil {
-		return err
-	}
-
-	// Flush the route for the entire subnet (in case it was added before)
-	_, err = exec.RunCommand("ip", "route", "flush", clustersubnet)
-	if err != nil {
-		return err
-	}
-
-	// Create a route for the entire subnet.
-	_, err = exec.RunCommand("ip", "route", "add", clustersubnet, "via", routerIP)
-	if err != nil {
-		return err
-	}
-
-	// Add the load_balancer to the switch.
-	k8sClusterLbTcp, err := exec.RunCommand("ovn-nbctl", "--data=bare", "--no-heading", "--columns=_uuid", "find", "load_balancer", "external_ids:k8s-cluster-lb-tcp=yes")
-	if err != nil {
-		return err
-	}
-	if k8sClusterLbTcp != "" {
-		_, err = exec.RunCommand("ovn-nbctl", "set", "logical_switch", nodename, "load_balancer="+k8sClusterLbTcp)
-		if err != nil {
-			return err
-		}
-	}
-
-	k8sClusterLbUdp, err := exec.RunCommand("ovn-nbctl", "--data=bare", "--no-heading", "--columns=_uuid", "find", "load_balancer", "external_ids:k8s-cluster-lb-udp=yes")
-	if err != nil {
-		return err
-	}
-	if k8sClusterLbUdp != "" {
-		_, err = exec.RunCommand("ovn-nbctl", "set", "logical_switch", nodename, "load_balancer="+k8sClusterLbUdp)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Create a logical switch and set its subnet.
-	_, err = exec.RunCommand("ovn-nbctl", "--", "--may-exist", "ls-add", nodename, "--", "set", "logical_switch", nodename, "other-config:subnet="+localsubnet)
-	if err != nil {
-		return err
-	}
-
+	return nil
 }

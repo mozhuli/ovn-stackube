@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	osExec "os/exec"
 
 	"github.com/heartlock/ovn-kubernetes/pkg/exec"
 	"github.com/spf13/cobra"
@@ -14,15 +15,16 @@ func InitMinion() *cobra.Command {
 		Use:   "minion [no options!]",
 		Short: "init ovn minion",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := initMinion(); err != nil {
+			if err := initMinion(cmd, args); err != nil {
 				return fmt.Errorf("failed init minion: %v", err)
 			}
+			return nil
 		},
 	}
 
 	MinionCmd.Flags().StringP("cluster-ip-subnet", "", "", "The cluster wide larger subnet of private ip addresses.")
-	MinionCmd.Flags().StringP("--minion-switch-subnet", "", "", "The smaller subnet just for this master.")
-	MasterCmd.Flags().StringP("node-name", "", "", "A unique node name.")
+	MinionCmd.Flags().StringP("minion-switch-subnet", "", "", "The smaller subnet just for this master.")
+	MinionCmd.Flags().StringP("node-name", "", "", "A unique node name.")
 
 	return MinionCmd
 }
@@ -33,9 +35,8 @@ func initMinion(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
 	minionSwitchSubnet := cmd.Flags().Lookup("minion-switch-subnet").Value.String()
-	if masterSwitchSubnet == "" {
+	if minionSwitchSubnet == "" {
 		return fmt.Errorf("failed get minion-switch-subnet")
 	}
 
@@ -45,13 +46,13 @@ func initMinion(cmd *cobra.Command, args []string) error {
 	}
 
 	nodeName := cmd.Flags().Lookup("node-name").Value.String()
-	if nodNname == "" {
+	if nodeName == "" {
 		return fmt.Errorf("failed get node-name")
 	}
 
-	cniPluginPath, err := exec.LookPath(CNI_PLUGIN)
+	cniPluginPath, err := osExec.LookPath(CNI_PLUGIN)
 	if err != nil {
-		return err
+		return fmt.Errorf("no cni plugin %v found", CNI_PLUGIN)
 	}
 
 	_, err = os.Stat(CNI_LINK_PATH)
@@ -64,7 +65,7 @@ func initMinion(cmd *cobra.Command, args []string) error {
 	cniFile := CNI_LINK_PATH + "/ovn_cni"
 	_, err = os.Stat(cniFile)
 	if err != nil && !os.IsExist(err) {
-		_, err = exec.RunCommand("ln", "-s", cni_plugin_path, cni_file)
+		_, err = exec.RunCommand("ln", "-s", cniPluginPath, cniFile)
 		if err != nil {
 			return err
 		}
@@ -83,24 +84,20 @@ func initMinion(cmd *cobra.Command, args []string) error {
 	_, err = os.Stat(cniConf)
 	if err != nil && !os.IsExist(err) {
 		// TODO:verify if it is needed to set config file in 10-net.conf
-		/*data := &main.NetConf{
-					"name": "net",
-		            "type": "ovn_cni",
-		            "bridge": "br-int",
-		            "isGateway": "true",
-		            "ipMasq": "false",
-		            "ipam": types.NetConf.IPAM{
-		                         "type": "host-local",
-		                         "subnet": minionSwitchSubnet,
-							},
+		data := "{\"bridge\": \"br-int\", \"ipMasq\": \"false\", \"name\": \"net\", \"ipam\": {\"subnet\": \"" + minionSwitchSubnet + "\", \"type\": \"host-local\"}, \"isGateway\": \"true\", \"type\": \"ovn_cni\"}"
+		f, err := os.OpenFile(cniConf, os.O_CREATE|os.O_WRONLY, 0666)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(f, data)
+		defer f.Close()
 
-					}
-		*/
 	}
 
 	err = createManagementPort(nodeName, minionSwitchSubnet, clusterIpSubnet)
 	if err != nil {
 		return err
 	}
+	return nil
 
 }
