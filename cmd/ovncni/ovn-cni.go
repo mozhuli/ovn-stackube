@@ -1,21 +1,8 @@
-// Copyright 2014 CNI authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -29,8 +16,8 @@ import (
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	//"github.com/containernetworking/cni/pkg/version"
-	"github.com/heartlock/ovn-kubernetes/pkg/common"
-	"github.com/heartlock/ovn-kubernetes/pkg/exec"
+	"github.com/mozhuli/ovn-stackube/pkg/common"
+	"github.com/mozhuli/ovn-stackube/pkg/exec"
 	"github.com/vishvananda/netlink"
 )
 
@@ -163,9 +150,10 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	var result *types.Result
 	ipc, ipnet, _ := net.ParseCIDR(ipAddress)
-	//ipg, _, err := net.ParseCIDR(gatewayIp)
+	ipg, _, err := net.ParseCIDR(gatewayIp)
+
 	ipnet.IP = ipc
-	result.IP4.IP = ipnet
+	result.IP4.IP = *ipnet
 	result.IP4.Gateway = ipg
 
 	netns, err := ns.GetNS(args.Netns)
